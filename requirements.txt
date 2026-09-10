@@ -1,0 +1,5 @@
+# Pipeline runtime deps — chạy local (không Kaggle, không vieneu/GPU).
+# Cài vào venv riêng: kaggle-pipeline/.venv (xem setup_local.sh).
+playwright
+ffmpeg-python
+edge-tts

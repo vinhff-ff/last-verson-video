@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+*/jobs/
+*.log
+
+# generated output (keep folder structure)
+kaggle-pipeline/generated/audio/*
+!kaggle-pipeline/generated/audio/.gitkeep
+kaggle-pipeline/generated/html/*
+!kaggle-pipeline/generated/html/.gitkeep
+kaggle-pipeline/generated/scripts/*
+!kaggle-pipeline/generated/scripts/.gitkeep
+kaggle-pipeline/generated/videos/*
+!kaggle-pipeline/generated/videos/.gitkeep

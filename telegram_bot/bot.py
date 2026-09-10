@@ -1,0 +1,336 @@
+"""bot.py — Telegram bot: nhận 2 ảnh nhân vật + kịch bản JSON, render video local, gửi mp4.
+
+Chạy:
+    python -m telegram_bot.bot
+
+Luồng: /start → bot gửi prompt cho AI ngoài (ChatGPT/Gemini) → user dán prompt
+vào AI ngoài, trả lời 2 câu (nhân vật A/B là ai), AI ngoài tự nghiên cứu và xuất
+JSON (mảng 10-15 câu thoại) + tóm tắt → user gửi về bot: 2 ảnh nhân vật + đoạn
+JSON → bot validate, render bằng pipeline local (edge-tts, giọng mặc định) →
+gửi video mp4 cho user.
+"""
+import asyncio
+import json
+import uuid
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import FSInputFile, Message
+
+from telegram_bot.config import (
+    BOT_TOKEN,
+    DEFAULT_VOICE,
+    JOBS_DIR,
+    LOCAL_VENV_PYTHON,
+)
+
+PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "external_ai.txt"
+EXTERNAL_AI_PROMPT = PROMPT_PATH.read_text(encoding="utf-8")
+LOCAL_JOB = Path(__file__).resolve().parent / "local_job.py"
+
+MIN_LINES = 10
+MAX_LINES = 15
+
+# Chỉ chạy 1 job render cùng lúc — tránh _purge_old_data xóa nhầm job đang chạy.
+RENDER_LOCK = asyncio.Lock()
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+
+class Job(StatesGroup):
+    wait_json = State()
+    wait_photo_a = State()
+    wait_photo_b = State()
+
+
+# ============================== /start, /cancel ==============================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(Job.wait_json)
+    await message.answer(
+        f"{EXTERNAL_AI_PROMPT}"
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Đã hủy. Gõ /start để làm lại.")
+
+
+# ============ bước 1: JSON kịch bản ============
+
+@router.message(Job.wait_json)
+async def on_scene_json(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Gửi đoạn JSON kịch bản (mảng 10-15 câu thoại).")
+        return
+    try:
+        lines = json.loads(text)
+    except json.JSONDecodeError:
+        await message.answer(
+            "❌ Không parse được JSON. Gửi lại đúng mảng JSON AI ngoài xuất ra, "
+            "vd:\n<code>[{&quot;char&quot;:&quot;A&quot;,&quot;text&quot;:&quot;...&quot;}, ...]</code>"
+        )
+        return
+
+    if not isinstance(lines, list):
+        await message.answer("❌ JSON phải là 1 mảng các câu thoại (vd: <code>[...]</code>).")
+        return
+    if not (MIN_LINES <= len(lines) <= MAX_LINES):
+        await message.answer(
+            f"❌ Kịch bản cần có {MIN_LINES}-{MAX_LINES} câu, bạn gửi {len(lines)} câu. "
+            "Nhờ AI ngoài viết lại cho đủ số câu nhé."
+        )
+        return
+
+    norm = []
+    for i, ln in enumerate(lines):
+        if isinstance(ln, str):
+            if not ln.strip():
+                await message.answer(f"❌ Câu {i+1} trống — kiểm tra lại JSON.")
+                return
+            norm.append(ln)
+        elif isinstance(ln, dict):
+            char = str(ln.get("char", "")).strip()
+            t = str(ln.get("text", "")).strip()
+            if char not in ("A", "B", "both") or not t:
+                await message.answer(
+                    f"❌ Câu {i+1} sai định dạng — mỗi phần tử cần "
+                    "<code>{&quot;char&quot;:&quot;A&quot;|&quot;B&quot;|&quot;both&quot;,&quot;text&quot;:&quot;...&quot;}</code>."
+                )
+                return
+            norm.append({"char": char, "text": t})
+        else:
+            await message.answer(f"❌ Câu {i+1} không phải chuỗi hay đối tượng JSON.")
+            return
+
+    data = await state.get_data()
+    data["script_lines"] = norm
+    await state.set_data(data)
+    await state.set_state(Job.wait_photo_a)
+    await message.answer(
+        f"✅ Đã nhận kịch bản ({len(lines)} câu).\n\n"
+        "Giờ gửi <b>ảnh nhân vật A</b>."
+    )
+
+
+# ============ bước 2: ảnh nhân vật A ============
+
+@router.message(Job.wait_photo_a, F.photo)
+async def on_photo_a(message: Message, state: FSMContext):
+    data = await state.get_data()
+    staging = Path(data.get("staging")) if data.get("staging") else None
+    if staging is None:
+        staging = JOBS_DIR / f"staging_{message.from_user.id}_{uuid.uuid4().hex[:6]}"
+        staging.mkdir(parents=True, exist_ok=True)
+        data["staging"] = str(staging)
+    path = staging / "a.jpg"
+    await message.bot.download(message.photo[-1], destination=path)
+    data["photo_a"] = str(path)
+    await state.set_data(data)
+    await state.set_state(Job.wait_photo_b)
+    await message.answer("✅ Đã nhận ảnh <b>nhân vật A</b>. Giờ gửi <b>ảnh nhân vật B</b>.")
+
+
+@router.message(Job.wait_photo_a)
+async def on_photo_a_wrong(message: Message):
+    await message.answer("⏳ Đang chờ <b>ảnh nhân vật A</b> — gửi 1 ảnh (không phải văn bản).")
+
+
+# ============ bước 3: ảnh nhân vật B → render ============
+
+@router.message(Job.wait_photo_b, F.photo)
+async def on_photo_b(message: Message, state: FSMContext):
+    data = await state.get_data()
+    staging = Path(data.get("staging")) if data.get("staging") else None
+    if staging is None:
+        staging = JOBS_DIR / f"staging_{message.from_user.id}_{uuid.uuid4().hex[:6]}"
+        staging.mkdir(parents=True, exist_ok=True)
+        data["staging"] = str(staging)
+    path = staging / "b.jpg"
+    await message.bot.download(message.photo[-1], destination=path)
+    data["photo_b"] = str(path)
+    await state.set_data(data)
+
+    await state.clear()
+    await message.answer("✅ Đã đủ: JSON + 2 ảnh. Đang render video… (vài phút)")
+    asyncio.create_task(_render_and_send(message.bot, message.chat.id, data))
+
+
+@router.message(Job.wait_photo_b)
+async def on_photo_b_wrong(message: Message):
+    await message.answer("⏳ Đang chờ <b>ảnh nhân vật B</b> — gửi 1 ảnh (không phải văn bản).")
+
+
+# ============================== render local ==============================
+
+def _purge_old_data(job_dir: Path, keep_dirs: tuple = ()) -> None:
+    """Xóa toàn bộ data của các job trước (để máy luôn nhẹ).
+
+    - Mọi job_id*/staging* còn sót trong JOBS_DIR (trừ job_dir đang dùng
+      và các thư mục trong keep_dirs, vd staging ảnh A/B của job hiện tại).
+    - Mọi artifact trong kaggle-pipeline/generated (audio/html/scripts/videos)
+      trừ các file .gitkeep.
+    Chạy ở đầu mỗi job mới.
+    """
+    import shutil
+    keep = {Path(p) for p in keep_dirs if p}
+    keep.add(job_dir)
+    for child in JOBS_DIR.iterdir():
+        if child in keep:
+            continue
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        except Exception:
+            pass
+
+    gen_root = Path(__file__).resolve().parent.parent.parent / "kaggle-pipeline" / "generated"
+    for sub in ("audio", "html", "scripts", "videos"):
+        d = gen_root / sub
+        if not d.exists():
+            continue
+        for f in d.iterdir():
+            if f.name == ".gitkeep":
+                continue
+            try:
+                if f.is_dir():
+                    shutil.rmtree(f, ignore_errors=True)
+                else:
+                    f.unlink()
+            except Exception:
+                pass
+
+
+async def _cleanup(data: dict, *dirs) -> None:
+    import glob
+    import shutil
+    paths = list(dirs)
+    staging = data.get("staging")
+    if staging:
+        paths.append(Path(staging))
+    for p in paths:
+        try:
+            if Path(p).is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+    # Dọn artifact trung gian của pipeline cho riêng run này.
+    # KHÔNG xóa video _final.mp4 ở đây — nó chỉ bị xóa SAU khi gửi thành công.
+    run_id = data.get("run_id")
+    if run_id:
+        base = Path(__file__).resolve().parent.parent.parent / "kaggle-pipeline" / "generated"
+        for pat in (f"audio/{run_id}/*", f"html/{run_id}.html",
+                    f"scripts/{run_id}.json", f"videos/{run_id}.mp4",
+                    f"videos/{run_id}.webm"):
+            for f in glob.glob(str(base / pat)):
+                try:
+                    Path(f).unlink()
+                except Exception:
+                    pass
+
+
+async def _render_and_send(bot_: Bot, chat_id: int, data: dict) -> None:
+    async with RENDER_LOCK:
+        await _render_and_send_locked(bot_, chat_id, data)
+
+
+async def _render_and_send_locked(bot_: Bot, chat_id: int, data: dict) -> None:
+    job_id = uuid.uuid4().hex[:8]
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    _purge_old_data(job_dir, keep_dirs=(data.get("staging"),))
+
+    meta = {
+        "run_id": f"tg_{job_id}",
+        "voice": DEFAULT_VOICE,
+        "script_lines": data["script_lines"],
+    }
+    (job_dir / "metadata.json").write_text(
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8"
+    )
+    import shutil
+    shutil.copy(data["photo_a"], job_dir / "image_a.jpg")
+    shutil.copy(data["photo_b"], job_dir / "image_b.jpg")
+
+    mp4: Path | None = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            LOCAL_VENV_PYTHON, str(LOCAL_JOB), str(job_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        print(f"[job:{job_id}] {stdout.decode(errors='replace')}")
+
+        result_path = job_dir / "result.json"
+        if not result_path.exists():
+            await bot_.send_message(chat_id, "❌ Không nhận được kết quả render.")
+            return
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        if not result.get("ok"):
+            await bot_.send_message(chat_id, f"❌ Render thất bại: {result.get('error')}")
+            return
+
+        mp4 = Path(result["mp4"])
+        if not mp4.exists():
+            await bot_.send_message(chat_id, "❌ Không thấy file video sau khi render.")
+            return
+        data["run_id"] = meta["run_id"]
+    except Exception as e:
+        await bot_.send_message(chat_id, f"⚠️ Lỗi khi chạy render: {e}")
+        return
+    finally:
+        # Dọn job_dir/staging/trung gian; KHÔNG xóa _final.mp4 (đang chờ gửi)
+        await _cleanup(data, job_dir)
+
+    # Gửi với retry — chỉ xóa video SAU khi gửi thành công.
+    sent = await _send_video_with_retry(bot_, chat_id, mp4)
+    if mp4 is not None and mp4.exists():
+        # Gửi xong (dù thành công hay bỏ cuộc sau retry) mới xóa video gốc
+        try:
+            mp4.unlink()
+        except Exception:
+            pass
+
+
+async def _send_video_with_retry(bot_: Bot, chat_id: int, mp4: Path,
+                                 max_retries: int = 3) -> bool:
+    last_err: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        if not mp4.exists():
+            await bot_.send_message(chat_id, "❌ File video đã bị mất trước khi gửi.")
+            return False
+        try:
+            await bot_.send_video(chat_id, FSInputFile(mp4),
+                                  caption="Video so sánh A/B của bạn ✅")
+            return True
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            print(f"[job] send_video attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(3 * attempt)
+    await bot_.send_message(chat_id, f"⚠️ Không gửi được video sau {max_retries} lần: {last_err}")
+    return False
+
+
+async def main() -> None:
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
