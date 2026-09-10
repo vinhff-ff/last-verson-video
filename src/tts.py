@@ -40,12 +40,13 @@ def get_audio_duration(path: Path) -> float:
 
 class TTSBackend:
     """Edge-tts facade. Instantiated once per run."""
-    def __init__(self, voice=None):
+    def __init__(self, voice=None, rate: str = "+25%"):
         self.voice = voice or EDGE_DEFAULT_VOICE
+        self.rate = rate
 
     async def synthesize(self, text: str, out_path: Path) -> float:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        communicate = edge_tts.Communicate(text, self.voice)
+        communicate = edge_tts.Communicate(text, self.voice, rate=self.rate)
         await communicate.save(str(out_path))
         return get_audio_duration(out_path)
 

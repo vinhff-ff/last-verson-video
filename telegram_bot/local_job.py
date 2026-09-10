@@ -13,8 +13,8 @@ import sys
 from pathlib import Path
 
 JOB_DIR = Path(sys.argv[1])
-PIPE_ROOT = Path(__file__).resolve().parent.parent.parent / "kaggle-pipeline"
-SRC = PIPE_ROOT / "src"
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / "src"
 
 
 async def main() -> int:

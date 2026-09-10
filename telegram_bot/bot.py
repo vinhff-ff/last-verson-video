@@ -199,7 +199,7 @@ def _purge_old_data(job_dir: Path, keep_dirs: tuple = ()) -> None:
         except Exception:
             pass
 
-    gen_root = Path(__file__).resolve().parent.parent.parent / "kaggle-pipeline" / "generated"
+    gen_root = Path(__file__).resolve().parent.parent / "generated"
     for sub in ("audio", "html", "scripts", "videos"):
         d = gen_root / sub
         if not d.exists():
@@ -233,7 +233,7 @@ async def _cleanup(data: dict, *dirs) -> None:
     # KHÔNG xóa video _final.mp4 ở đây — nó chỉ bị xóa SAU khi gửi thành công.
     run_id = data.get("run_id")
     if run_id:
-        base = Path(__file__).resolve().parent.parent.parent / "kaggle-pipeline" / "generated"
+        base = Path(__file__).resolve().parent.parent / "generated"
         for pat in (f"audio/{run_id}/*", f"html/{run_id}.html",
                     f"scripts/{run_id}.json", f"videos/{run_id}.mp4",
                     f"videos/{run_id}.webm"):

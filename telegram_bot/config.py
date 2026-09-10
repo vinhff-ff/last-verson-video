@@ -27,7 +27,7 @@ ASSETS_DIR = BASE_DIR / "telegram_bot" / "assets"
 # playwright/edge-tts vào python hệ thống của bot.
 LOCAL_VENV_PYTHON = os.getenv(
     "LOCAL_VENV_PYTHON",
-    str(BASE_DIR.parent / "kaggle-pipeline" / ".venv" / "bin" / "python"),
+    str(BASE_DIR / "kaggle-pipeline" / ".venv" / "bin" / "python"),
 )
 
 # Asset cố định dùng lại cho mọi video (phục vụ trực tiếp từ máy local).
